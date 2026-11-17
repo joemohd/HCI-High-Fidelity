@@ -1,0 +1,65 @@
+# Materials for Robot Vacuum with Manipulator
+
+newmtl black
+Ka 0.0045 0.0055 0.0070
+Kd 0.0180 0.0220 0.0280
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
+
+newmtl dark
+Ka 0.0138 0.0163 0.0187
+Kd 0.0550 0.0650 0.0750
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
+
+newmtl rubber
+Ka 0.0020 0.0025 0.0030
+Kd 0.0080 0.0100 0.0120
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
+
+newmtl silver
+Ka 0.1050 0.1150 0.1250
+Kd 0.4200 0.4600 0.5000
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
+
+newmtl steel
+Ka 0.0500 0.0575 0.0675
+Kd 0.2000 0.2300 0.2700
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
+
+newmtl blue
+Ka 0.0125 0.1375 0.2050
+Kd 0.0500 0.5500 0.8200
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
+
+newmtl glass
+Ka 0.0063 0.0112 0.0150
+Kd 0.0250 0.0450 0.0600
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
+
+newmtl grey
+Ka 0.0700 0.0750 0.0800
+Kd 0.2800 0.3000 0.3200
+Ks 0.18 0.18 0.18
+Ns 40
+d 1.0
+illum 2
