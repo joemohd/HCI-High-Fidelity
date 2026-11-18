@@ -163,8 +163,7 @@ namespace LowPolyInteriors
         public static void SpinFansInScene()
         {
             int n = 0;
-            foreach (var t in Object.FindObjectsByType<Transform>(
-                         FindObjectsSortMode.None))
+            foreach (var t in Object.FindObjectsByType<Transform>())
             {
                 var nm = t.name.ToLowerInvariant();
                 if (!nm.Contains("ceilingfan") && !nm.Contains("extractfan"))

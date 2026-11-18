@@ -55,6 +55,8 @@ namespace EcoBot
         public bool autoPickupByTag = true;
         [Tooltip("Tag required on objects to be automatically picked up.")]
         public string pickupTag = "Pickupable";
+        [Tooltip("Tag for objects that require asking the user for guidance before picking up.")]
+        public string unsureTag = "Unsure";
         [Tooltip("Radius of the detection zone around the robot (local units).")]
         public float detectionRadius = 1.35f;
         [Tooltip("Center of the detection zone relative to the robot root (local units).")]
@@ -121,6 +123,11 @@ namespace EcoBot
             AutoAssign();
             Initialize();
             SetupProximitySensor();
+
+            if (GetComponent<UnityEngine.AI.NavMeshAgent>() && !GetComponent<RobotCleanerAI>())
+            {
+                gameObject.AddComponent<RobotCleanerAI>();
+            }
         }
 
         void Start()
@@ -294,19 +301,21 @@ namespace EcoBot
             return null;
         }
 
-        bool HasPickupTag(GameObject go)
+        bool HasTag(GameObject go, string tagName)
         {
-            if (string.IsNullOrEmpty(pickupTag))
+            if (!go || string.IsNullOrEmpty(tagName))
                 return false;
             try
             {
-                return go.CompareTag(pickupTag);
+                return go.CompareTag(tagName);
             }
             catch (UnityException)
             {
                 return false;
             }
         }
+
+        bool HasPickupTag(GameObject go) => HasTag(go, pickupTag) || HasTag(go, unsureTag);
 
         bool IsCandidateValidAndReachable(GameObject candidate, out float sqrDist)
         {
@@ -382,17 +391,16 @@ namespace EcoBot
         // ------------------------------------------------------------------ public API
 
         /// <summary>
-        /// TODO: AI decision function to determine if the robot is confident to pick up 'target'.
-        /// Returns true if confident to pick up immediately.
-        /// Returns false if uncertain, which triggers asking the user for guidance.
+        /// Evaluates whether the robot is confident to pick up 'target' without human guidance.
+        /// Returns false if 'target' is tagged with unsureTag ("Unsure"), triggering AskUserForGuidance.
         /// </summary>
         /// <param name="target">The candidate GameObject to be evaluated.</param>
         /// <returns>True to proceed with pickup, false to ask user for guidance.</returns>
         public bool ShouldPickUpWithoutGuidance(GameObject target)
         {
-            // TODO: Use AI to evaluate whether to pick up 'target' without human intervention.
-            // Returning true means confident -> pick up automatically.
-            // Returning false means uncertain -> prompt user for guidance.
+            if (HasTag(target, unsureTag))
+                return false;
+
             return true;
         }
 
@@ -402,7 +410,7 @@ namespace EcoBot
         /// <param name="target">The candidate GameObject requiring human clarification.</param>
         public void AskUserForGuidance(GameObject target)
         {
-            // TODO: Trigger UI / audio / confirmation prompt asking the user for guidance.
+            Debug.Log($"{name}: Unsure about picking up '{target.name}'. Need to get user attention for guidance.", this);
         }
 
         /// <summary>Pick up an object and hold it (or place it at dropPoint if given; defaults to testDropPoint if null).</summary>
@@ -415,6 +423,8 @@ namespace EcoBot
             // AI Decision: decide whether to proceed autonomously or ask the user for guidance
             if (!ShouldPickUpWithoutGuidance(target))
             {
+                if (rePickCooldown > 0f)
+                    ignoreUntilTime[target] = Time.time + rePickCooldown;
                 AskUserForGuidance(target);
                 return false;
             }
