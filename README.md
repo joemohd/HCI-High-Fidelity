@@ -5,10 +5,11 @@ Quick reference for implementing the vacuum robot's navigation AI.
 ---
 
 ## 1. What Items Does the Robot Pick Up?
-* **Tag:** Any object tagged **`Pickupable`**.
+* **Layer:** Any object in **`Pickupable`**.
 * **Requirements:** The object must have a **Collider** (and optionally a Rigidbody).
-* **Detection:** The robot automatically detects items within a **~1.35m radius** around its front.
+* **Detection:** The robot automatically detects items within a **~1m radius** around its front.
 
+If layer is Vacuumable, the item is vacuumed. If avoidable, the item is avoided
 ---
 
 ## 2. Where Does It Put Them Down?
