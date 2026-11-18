@@ -74,6 +74,8 @@ namespace EcoBot
         [Header("Events")]
         public UnityEvent<GameObject> onPickedUp;
         public UnityEvent<GameObject> onReleased;
+        [Tooltip("Raised when the robot is unsure about an object and needs the user to decide (hook a UI prompt here).")]
+        public UnityEvent<GameObject> onGuidanceNeeded;
 
         public bool IsBusy { get; private set; }
         public GameObject HeldObject { get; private set; }
@@ -113,6 +115,9 @@ namespace EcoBot
         readonly Dictionary<GameObject, float> ignoreUntilTime = new Dictionary<GameObject, float>();
         readonly Collider[] overlapBuffer = new Collider[32];
         SphereCollider proximityTrigger;
+
+        // Objects the user has explicitly approved after the robot asked for guidance
+        readonly HashSet<GameObject> approvedByUser = new HashSet<GameObject>();
 
         // ------------------------------------------------------------------ setup
 
@@ -398,19 +403,31 @@ namespace EcoBot
         /// <returns>True to proceed with pickup, false to ask user for guidance.</returns>
         public bool ShouldPickUpWithoutGuidance(GameObject target)
         {
+            // The user already answered "yes, pick it up" for this object
+            if (target && approvedByUser.Contains(target))
+                return true;
+
             if (HasTag(target, unsureTag))
                 return false;
 
             return true;
         }
 
+        /// <summary>Called by UI/other scripts when the user approves picking up an 'Unsure' object.</summary>
+        public void ApproveByUser(GameObject target)
+        {
+            if (target) approvedByUser.Add(target);
+        }
+
         /// <summary>
-        /// TODO: Handle prompting the user for guidance when ShouldPickUpWithoutGuidance returns false.
+        /// Raises onGuidanceNeeded so a UI prompt can ask the user; the answer comes back through
+        /// RobotCleanerAI.ProvideGuidance(target, approve).
         /// </summary>
         /// <param name="target">The candidate GameObject requiring human clarification.</param>
         public void AskUserForGuidance(GameObject target)
         {
             Debug.Log($"{name}: Unsure about picking up '{target.name}'. Need to get user attention for guidance.", this);
+            onGuidanceNeeded?.Invoke(target);
         }
 
         /// <summary>Pick up an object and hold it (or place it at dropPoint if given; defaults to testDropPoint if null).</summary>

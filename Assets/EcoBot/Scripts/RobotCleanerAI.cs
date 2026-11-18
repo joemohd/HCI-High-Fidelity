@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.AI;
+using UnityEngine.Events;
 
 namespace EcoBot
 {
@@ -27,7 +28,8 @@ namespace EcoBot
             DroppingOff,
             MovingToVacuumable,
             Vacuuming,
-            Completed
+            Completed,
+            Yielding   // appended last so existing serialized values stay valid
         }
 
         [Header("References")]
@@ -64,12 +66,57 @@ namespace EcoBot
         [Tooltip("Start scanning and cleaning automatically when Play begins.")]
         public bool autoStartOnPlay = true;
 
+        [Header("Dynamic Obstacle Avoidance (Sensor)")]
+        [Tooltip("Sense obstacles ahead every frame and stop/yield instead of driving into them.")]
+        public bool enableObstacleAvoidance = true;
+
+        [Tooltip("Layers the sensor reacts to (people, moving toys, anything NOT baked into the NavMesh). Defaults to the 'Avoidables' layer. Do NOT include Pickupables/Vacuumables or static furniture.")]
+        public LayerMask obstacleMask;
+
+        [Tooltip("How far ahead along the route the sensor looks (robot-local units).")]
+        public float localObstacleDetectionDistance = 2.5f;
+
+        [Tooltip("Radius of the sensor capsule (robot-local units).")]
+        public float localObstacleSensorRadius = 0.6f;
+
+        [Tooltip("Height of the sensor capsule above the floor (robot-local units).")]
+        public float localObstacleSensorHeight = 0.5f;
+
+        [Tooltip("The path must stay clear this many seconds before the robot resumes (prevents flickering).")]
+        public float clearPathDelay = 0.5f;
+
+        [Tooltip("Degrees/sec the robot turns to face a blocking obstacle while waiting.")]
+        public float yieldTurnSpeed = 180f;
+
+        [Tooltip("If still blocked after this many seconds, the robot asks the user for help.")]
+        public float blockedHelpAfterSeconds = 6f;
+
+        [Header("Live Re-scan")]
+        [Tooltip("Seconds between re-scans for new/moved targets while cleaning.")]
+        public float rescanInterval = 1.5f;
+
+        [Header("Events (hook UI here)")]
+        [Tooltip("Human-readable status, e.g. 'Path blocked - waiting'. Connect to a text/notification UI.")]
+        public UnityEvent<string> onStatusMessage;
+
         [Header("Runtime Status (Read-Only)")]
         [SerializeField] private CleanerState currentState = CleanerState.Idle;
         [SerializeField] private GameObject currentTarget;
         [SerializeField] private List<GameObject> remainingTargets = new List<GameObject>();
 
         private readonly HashSet<GameObject> deliveredObjects = new HashSet<GameObject>();
+
+        // Objects the robot is unsure about / could not pick up. They are left alone until the user decides.
+        private readonly HashSet<GameObject> skippedObjects = new HashSet<GameObject>();
+
+        // Obstacle-avoidance runtime state
+        private readonly Collider[] obstacleBuffer = new Collider[16];
+        private CleanerState stateBeforeYield;
+        private float resumeAfter;
+        private float yieldStartTime;
+        private bool helpRequested;
+        private float nextRescanTime;
+        private Vector3 lastTargetPosition;
 
         public CleanerState State => currentState;
         public GameObject CurrentTarget => currentTarget;
@@ -104,6 +151,12 @@ namespace EcoBot
                 int vLayer = LayerMask.NameToLayer("Vacuumables");
                 if (vLayer != -1) vacuumablesMask = 1 << vLayer;
             }
+
+            if (obstacleMask.value == 0)
+            {
+                int aLayer = LayerMask.NameToLayer("Avoidables");
+                if (aLayer != -1) obstacleMask = 1 << aLayer;
+            }
         }
 
         void Start()
@@ -121,6 +174,13 @@ namespace EcoBot
                     dropOffLocation = arm.testDropPoint;
                 }
                 arm.testDropPoint = null;
+            }
+
+            if (!agent)
+            {
+                Debug.LogError("[RobotCleanerAI] No NavMeshAgent found on this robot.", this);
+                enabled = false;
+                return;
             }
 
             // Ensure agent is snapped onto the NavMesh at start
@@ -145,6 +205,7 @@ namespace EcoBot
         public void StartCleaning()
         {
             StopAllCoroutines();
+            currentTarget = null;
             ScanRoom();
             SelectAndMoveToNextTarget();
         }
@@ -156,10 +217,20 @@ namespace EcoBot
         {
             currentState = CleanerState.Scanning;
             remainingTargets.Clear();
+            AddNewTargets();
+            Debug.Log($"[RobotCleanerAI] Room scan complete. Found {remainingTargets.Count} target(s).");
+        }
 
+        /// <summary>
+        /// Adds any Pickupable/Vacuumable objects that are not already queued, delivered or skipped.
+        /// Used by the initial scan and by the live re-scan, so toys added or moved at runtime are noticed.
+        /// </summary>
+        /// <returns>Number of new targets added.</returns>
+        int AddNewTargets()
+        {
             int combinedMask = pickupablesMask.value | vacuumablesMask.value;
             Collider[] allColliders = FindObjectsByType<Collider>();
-            HashSet<GameObject> uniqueObjects = new HashSet<GameObject>();
+            int added = 0;
 
             foreach (Collider col in allColliders)
             {
@@ -167,15 +238,16 @@ namespace EcoBot
                 if (col.transform.IsChildOf(transform)) continue;
 
                 GameObject rootCandidate = ResolveTargetRoot(col, combinedMask);
-                if (!rootCandidate || deliveredObjects.Contains(rootCandidate)) continue;
+                if (!rootCandidate) continue;
+                if (deliveredObjects.Contains(rootCandidate) || skippedObjects.Contains(rootCandidate)) continue;
+                if (rootCandidate == currentTarget || remainingTargets.Contains(rootCandidate)) continue;
+                if (arm && arm.HeldObject == rootCandidate) continue;
 
-                if (uniqueObjects.Add(rootCandidate))
-                {
-                    remainingTargets.Add(rootCandidate);
-                }
+                remainingTargets.Add(rootCandidate);
+                added++;
             }
 
-            Debug.Log($"[RobotCleanerAI] Room scan complete. Found {remainingTargets.Count} target(s).");
+            return added;
         }
 
         GameObject ResolveTargetRoot(Collider col, int layerMask)
@@ -200,7 +272,8 @@ namespace EcoBot
 
         void SelectAndMoveToNextTarget()
         {
-            remainingTargets.RemoveAll(item => item == null || !item.activeInHierarchy || deliveredObjects.Contains(item));
+            remainingTargets.RemoveAll(item => item == null || !item.activeInHierarchy ||
+                                               deliveredObjects.Contains(item) || skippedObjects.Contains(item));
 
             if (remainingTargets.Count == 0)
             {
@@ -226,6 +299,7 @@ namespace EcoBot
 
             currentTarget = remainingTargets[bestIndex];
             remainingTargets.RemoveAt(bestIndex);
+            lastTargetPosition = currentTarget.transform.position;
 
             bool isPickupable = IsInLayerMask(currentTarget.layer, pickupablesMask.value);
 
@@ -257,6 +331,31 @@ namespace EcoBot
                 if (agent && agent.isOnNavMesh && !agent.isStopped)
                     agent.isStopped = true;
                 return;
+            }
+
+            // SENSE -> THINK -> ACT: while waiting for an obstacle to clear, only the yield logic runs
+            if (currentState == CleanerState.Yielding)
+            {
+                UpdateYielding();
+                return;
+            }
+
+            // SENSE: look along the route for something on the obstacle layers
+            if (IsTravelState(currentState) && agent.isOnNavMesh && !agent.pathPending
+                && agent.remainingDistance > WorldApproachDistance)
+            {
+                Collider blocker = DetectObstacleAhead();
+                if (blocker)
+                {
+                    BeginYield(blocker);   // THINK + ACT: stop and wait
+                    return;
+                }
+            }
+
+            // Keep the target list and destination in sync with the live scene
+            if (IsTravelState(currentState) || currentState == CleanerState.Completed)
+            {
+                TickLiveRescan();
             }
 
             switch (currentState)
@@ -303,6 +402,210 @@ namespace EcoBot
             }
         }
 
+        // ------------------------------------------------------------------ obstacle sensing & yielding
+
+        static bool IsTravelState(CleanerState state) =>
+            state == CleanerState.MovingToPickupable ||
+            state == CleanerState.MovingToDropOff ||
+            state == CleanerState.MovingToVacuumable;
+
+        /// <summary>Direction of travel along the NavMesh route (not where the model faces).</summary>
+        Vector3 RouteDirection()
+        {
+            Vector3 dir = agent.steeringTarget - transform.position;
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.0001f)
+            {
+                dir = agent.velocity;
+                dir.y = 0f;
+            }
+            if (dir.sqrMagnitude < 0.0001f)
+            {
+                dir = transform.forward;
+                dir.y = 0f;
+            }
+            return dir.normalized;
+        }
+
+        /// <summary>
+        /// SENSE: returns the closest collider on the obstacle layers inside a capsule that points
+        /// along the route, or null if the way is clear. Ignores the robot itself, the object it
+        /// carries, and the object it is heading to.
+        /// </summary>
+        Collider DetectObstacleAhead()
+        {
+            if (!enableObstacleAvoidance || obstacleMask.value == 0 || !agent) return null;
+
+            float s = WorldScale;
+            Vector3 start = transform.position + Vector3.up * (localObstacleSensorHeight * s);
+            Vector3 end = start + RouteDirection() * (localObstacleDetectionDistance * s);
+            float radius = localObstacleSensorRadius * s;
+
+            int count = Physics.OverlapCapsuleNonAlloc(start, end, radius, obstacleBuffer,
+                obstacleMask, QueryTriggerInteraction.Ignore);
+
+            Collider closest = null;
+            float bestSqr = float.MaxValue;
+            for (int i = 0; i < count; i++)
+            {
+                Collider col = obstacleBuffer[i];
+                if (!col || !col.gameObject.activeInHierarchy) continue;
+                if (col.transform.IsChildOf(transform)) continue;
+                if (arm && arm.HeldObject && col.transform.IsChildOf(arm.HeldObject.transform)) continue;
+                if (currentTarget && col.transform.IsChildOf(currentTarget.transform)) continue;
+
+                float sqr = (col.ClosestPoint(start) - start).sqrMagnitude;
+                if (sqr < bestSqr)
+                {
+                    bestSqr = sqr;
+                    closest = col;
+                }
+            }
+
+            return closest;
+        }
+
+        void BeginYield(Collider blocker)
+        {
+            stateBeforeYield = currentState;
+            currentState = CleanerState.Yielding;
+            agent.isStopped = true;
+            yieldStartTime = Time.time;
+            resumeAfter = Time.time + clearPathDelay;
+            helpRequested = false;
+            Say($"Path blocked by '{blocker.name}'. Waiting for it to clear.");
+        }
+
+        void UpdateYielding()
+        {
+            Collider blocker = DetectObstacleAhead();
+            if (blocker)
+            {
+                // Still blocked: restart the clear-path countdown and keep facing the obstacle
+                resumeAfter = Time.time + clearPathDelay;
+                FaceTowards(blocker.bounds.center);
+
+                if (!helpRequested && Time.time - yieldStartTime >= blockedHelpAfterSeconds)
+                {
+                    helpRequested = true;
+                    Say($"Still blocked by '{blocker.name}'. Could you please move it or guide me?");
+                }
+                return;
+            }
+
+            // Clear for a full clearPathDelay -> resume
+            if (Time.time >= resumeAfter)
+            {
+                EndYield();
+            }
+        }
+
+        void EndYield()
+        {
+            currentState = stateBeforeYield;
+
+            // Target may have been removed or collected while we waited
+            bool needsTarget = currentState != CleanerState.MovingToDropOff;
+            if (needsTarget && (!currentTarget || !currentTarget.activeInHierarchy))
+            {
+                SelectAndMoveToNextTarget();
+                return;
+            }
+
+            // Re-plan from where we stand: the NavMesh may have changed (e.g. a carving obstacle moved)
+            agent.isStopped = false;
+            agent.SetDestination(ComputeDestination(currentState));
+            Say("Path clear. Resuming.");
+        }
+
+        Vector3 ComputeDestination(CleanerState travelState)
+        {
+            switch (travelState)
+            {
+                case CleanerState.MovingToPickupable:
+                    return GetTargetApproachPosition(currentTarget.transform, WorldApproachDistance);
+                case CleanerState.MovingToVacuumable:
+                    return SampleNavMesh(currentTarget.transform.position, 2.0f);
+                case CleanerState.MovingToDropOff:
+                    return GetDropOffApproachPosition(dropOffLocation);
+                default:
+                    return agent.destination;
+            }
+        }
+
+        void FaceTowards(Vector3 worldPoint)
+        {
+            Vector3 flat = worldPoint - transform.position;
+            flat.y = 0f;
+            if (flat.sqrMagnitude < 0.0001f) return;
+
+            transform.rotation = Quaternion.RotateTowards(
+                transform.rotation,
+                Quaternion.LookRotation(flat.normalized, Vector3.up),
+                yieldTurnSpeed * Time.deltaTime);
+        }
+
+        void Say(string message)
+        {
+            Debug.Log($"[RobotCleanerAI] {message}");
+            onStatusMessage?.Invoke(message);
+        }
+
+        // ------------------------------------------------------------------ live re-scan
+
+        void TickLiveRescan()
+        {
+            if (Time.time < nextRescanTime) return;
+            nextRescanTime = Time.time + rescanInterval;
+
+            int added = AddNewTargets();
+
+            if (currentState == CleanerState.Completed)
+            {
+                // New litter appeared after we finished: go back to work
+                if (added > 0)
+                {
+                    Say($"Found {added} new item(s). Resuming cleaning.");
+                    SelectAndMoveToNextTarget();
+                }
+                return;
+            }
+
+            // The target was moved (e.g. a child picked it up and dropped it elsewhere): re-aim
+            if (currentTarget && currentState != CleanerState.MovingToDropOff &&
+                (currentTarget.transform.position - lastTargetPosition).sqrMagnitude > 0.01f)
+            {
+                lastTargetPosition = currentTarget.transform.position;
+                agent.SetDestination(ComputeDestination(currentState));
+            }
+        }
+
+        /// <summary>
+        /// Called by UI/other scripts when the user answers the robot's question about an uncertain object.
+        /// approve = true  -> the robot will pick it up and deliver it.
+        /// approve = false -> the robot leaves it untouched.
+        /// </summary>
+        public void ProvideGuidance(GameObject target, bool approve)
+        {
+            if (!target) return;
+
+            if (!approve)
+            {
+                skippedObjects.Add(target);
+                Say($"Leaving '{target.name}' untouched.");
+                return;
+            }
+
+            if (arm) arm.ApproveByUser(target);
+            skippedObjects.Remove(target);
+            if (!remainingTargets.Contains(target)) remainingTargets.Add(target);
+
+            if (currentState == CleanerState.Completed || currentState == CleanerState.Idle)
+            {
+                SelectAndMoveToNextTarget();
+            }
+        }
+
         bool HasArrived()
         {
             if (!agent || !agent.isOnNavMesh || agent.pathPending) return false;
@@ -329,9 +632,13 @@ namespace EcoBot
                     if (NavMesh.SamplePosition(adjustedPos, out NavMeshHit hit, 0.3f, NavMesh.AllAreas))
                     {
                         float moveSpeed = agent ? agent.speed : 0.5f;
-                        while (Vector3.Distance(transform.position, hit.position) > 0.01f)
+                        float elapsed = 0f;
+                        while (elapsed < 2f && Vector3.Distance(transform.position, hit.position) > 0.01f)
                         {
-                            transform.position = Vector3.MoveTowards(transform.position, hit.position, moveSpeed * Time.deltaTime);
+                            // agent.Move keeps the robot on the NavMesh (unlike writing transform.position)
+                            Vector3 next = Vector3.MoveTowards(transform.position, hit.position, moveSpeed * Time.deltaTime);
+                            agent.Move(next - transform.position);
+                            elapsed += Time.deltaTime;
                             yield return null;
                         }
                     }
@@ -343,10 +650,20 @@ namespace EcoBot
             currentState = CleanerState.PickingUp;
             if (arm && currentTarget)
             {
-                bool started = arm.PickUp(currentTarget, dropPoint: null);
+                GameObject attempted = currentTarget;
+                bool started = arm.PickUp(attempted, dropPoint: null);
                 if (started)
                 {
                     yield return new WaitUntil(() => !arm.IsBusy);
+                }
+                else
+                {
+                    // Leave it alone so the live re-scan does not queue it again every second
+                    skippedObjects.Add(attempted);
+                    if (!arm.ShouldPickUpWithoutGuidance(attempted))
+                        Say($"Not sure about '{attempted.name}'. Waiting for your guidance.");
+                    else
+                        Say($"Could not reach '{attempted.name}'. Skipping it.");
                 }
             }
 
@@ -465,6 +782,22 @@ namespace EcoBot
             if (NavMesh.SamplePosition(point, out NavMeshHit hit, maxDistance, NavMesh.AllAreas))
                 return hit.position;
             return point;
+        }
+
+        void OnDrawGizmosSelected()
+        {
+            float s = WorldScale;
+            Vector3 dir = transform.forward;
+            if (Application.isPlaying && agent && agent.isOnNavMesh) dir = RouteDirection();
+
+            Vector3 start = transform.position + Vector3.up * (localObstacleSensorHeight * s);
+            Vector3 end = start + dir * (localObstacleDetectionDistance * s);
+            float radius = localObstacleSensorRadius * s;
+
+            Gizmos.color = currentState == CleanerState.Yielding ? Color.red : Color.yellow;
+            Gizmos.DrawWireSphere(start, radius);
+            Gizmos.DrawWireSphere(end, radius);
+            Gizmos.DrawLine(start, end);
         }
     }
 }
