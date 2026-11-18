@@ -30,13 +30,17 @@ namespace EcoBot
             Vacuuming,
             Completed,
             Yielding,          // appended last so existing serialized values stay valid
-            AwaitingGuidance   // NEW: robot paused, waiting for user to answer the prompt
+            AwaitingGuidance,  // NEW: robot paused, waiting for user to answer the prompt
+            Wandering,         // robot vacuum wandering mode
+            DetouringAroundAvoidable // brief turn-around when encountering an avoidable without freezing
         }
 
         [Header("References")]
         public RobotArmController arm;
         public NavMeshAgent agent;
         public Transform dropOffLocation;
+        [Tooltip("Optional drop-off location for pickupable items tagged \"Litter\". Falls back to dropOffLocation if unassigned.")]
+        public Transform trashCanLocation;
 
         [Header("Layer Configuration")]
         public LayerMask pickupablesMask;
@@ -62,8 +66,18 @@ namespace EcoBot
         [Header("Live Re-scan")]
         public float rescanInterval = 1.5f;
 
+        [Header("Wandering (Robot Vacuum Mode)")]
+        public bool wanderMode = true;
+        public float wanderRadius = 8f;
+        public float pickupDetectionRadius = 2.5f;
+        public float vacuumDetectionRadius = 2.5f;
+        public float avoidableReverseRadius = 2.5f;
+        [Tooltip("Layers of avoidable items that cause the robot to reverse direction within 2.5m. Falls back to obstacleMask if Nothing.")]
+        public LayerMask avoidableMask;
+
         [Header("Events (hook UI here)")]
         public UnityEvent<string> onStatusMessage;
+        public UnityEvent<GameObject> onAvoidableEncountered;
 
         [Header("Runtime Status (Read-Only)")]
         [SerializeField] private CleanerState currentState = CleanerState.Idle;
@@ -73,6 +87,7 @@ namespace EcoBot
         private readonly HashSet<GameObject> deliveredObjects = new HashSet<GameObject>();
         private readonly HashSet<GameObject> skippedObjects = new HashSet<GameObject>();
         private readonly HashSet<GameObject> guidanceResolved = new HashSet<GameObject>(); // NEW
+        private readonly Queue<GameObject> seenTargetsQueue = new Queue<GameObject>();
 
         private readonly Collider[] obstacleBuffer = new Collider[16];
         private CleanerState stateBeforeYield;
@@ -81,6 +96,12 @@ namespace EcoBot
         private bool helpRequested;
         private float nextRescanTime;
         private Vector3 lastTargetPosition;
+        private float nextReverseTime;
+        private CleanerState stateBeforeDetour;
+        private float detourEndTime;
+        private float nextAvoidableDetourTime;
+        private float nextAvoidableAlertTime;
+        private int avoidablesLayer = -1;
 
         public CleanerState State => currentState;
         public GameObject CurrentTarget => currentTarget;
@@ -107,11 +128,11 @@ namespace EcoBot
                 int vLayer = LayerMask.NameToLayer("Vacuumables");
                 if (vLayer != -1) vacuumablesMask = 1 << vLayer;
             }
-            if (obstacleMask.value == 0)
-            {
-                int aLayer = LayerMask.NameToLayer("Avoidables");
-                if (aLayer != -1) obstacleMask = 1 << aLayer;
-            }
+            avoidablesLayer = LayerMask.NameToLayer("Avoidables");
+            if (avoidableMask.value == 0 && avoidablesLayer != -1)
+                avoidableMask = 1 << avoidablesLayer;
+            if (obstacleMask.value == 0 && avoidablesLayer != -1)
+                obstacleMask = 1 << avoidablesLayer;
         }
 
         void Start()
@@ -160,32 +181,47 @@ namespace EcoBot
         int AddNewTargets()
         {
             int combinedMask = pickupablesMask.value | vacuumablesMask.value;
-            Collider[] allColliders = FindObjectsByType<Collider>(FindObjectsSortMode.None);
             int added = 0;
 
-            foreach (Collider col in allColliders)
+            foreach (Collider col in FindObjectsByType<Collider>())
             {
                 if (!col || !col.gameObject.activeInHierarchy) continue;
                 if (col.transform.IsChildOf(transform)) continue;
 
-                GameObject rootCandidate = ResolveTargetRoot(col, combinedMask);
-                if (!rootCandidate) continue;
-                if (deliveredObjects.Contains(rootCandidate) || skippedObjects.Contains(rootCandidate)) continue;
-                if (rootCandidate == currentTarget || remainingTargets.Contains(rootCandidate)) continue;
-                if (arm && arm.HeldObject == rootCandidate) continue;
-
-                remainingTargets.Add(rootCandidate);
-                added++;
+                GameObject rootCandidate = ResolveTargetRoot(col.transform, col.attachedRigidbody, combinedMask);
+                if (TryRegisterTarget(rootCandidate)) added++;
             }
+
+            // Also scan Renderers so items without a Collider (e.g. raw FBX Vacuumables) are still found.
+            foreach (Renderer rend in FindObjectsByType<Renderer>())
+            {
+                if (!rend || !rend.gameObject.activeInHierarchy) continue;
+                if (rend.transform.IsChildOf(transform)) continue;
+
+                GameObject rootCandidate = ResolveTargetRoot(rend.transform, null, combinedMask);
+                if (TryRegisterTarget(rootCandidate)) added++;
+            }
+
             return added;
         }
 
-        GameObject ResolveTargetRoot(Collider col, int layerMask)
+        bool TryRegisterTarget(GameObject rootCandidate)
         {
-            if (col.attachedRigidbody && IsInLayerMask(col.attachedRigidbody.gameObject.layer, layerMask))
-                return col.attachedRigidbody.gameObject;
+            if (!rootCandidate) return false;
+            if (deliveredObjects.Contains(rootCandidate) || skippedObjects.Contains(rootCandidate)) return false;
+            if (rootCandidate == currentTarget || remainingTargets.Contains(rootCandidate)) return false;
+            if (arm && arm.HeldObject == rootCandidate) return false;
 
-            Transform t = col.transform;
+            remainingTargets.Add(rootCandidate);
+            return true;
+        }
+
+        GameObject ResolveTargetRoot(Transform startTransform, Rigidbody attachedRb, int layerMask)
+        {
+            if (attachedRb && IsInLayerMask(attachedRb.gameObject.layer, layerMask))
+                return attachedRb.gameObject;
+
+            Transform t = startTransform;
             GameObject match = null;
             while (t != null)
             {
@@ -201,6 +237,24 @@ namespace EcoBot
         {
             remainingTargets.RemoveAll(item => item == null || !item.activeInHierarchy ||
                                                deliveredObjects.Contains(item) || skippedObjects.Contains(item));
+
+            if (wanderMode)
+            {
+                while (seenTargetsQueue.Count > 0)
+                {
+                    GameObject queued = seenTargetsQueue.Dequeue();
+                    if (queued == null || !queued.activeInHierarchy ||
+                        deliveredObjects.Contains(queued) || skippedObjects.Contains(queued))
+                        continue;
+
+                    remainingTargets.Remove(queued);
+                    MoveToTarget(queued);
+                    return;
+                }
+
+                StartWandering();
+                return;
+            }
 
             if (remainingTargets.Count == 0)
             {
@@ -221,6 +275,12 @@ namespace EcoBot
 
             currentTarget = remainingTargets[bestIndex];
             remainingTargets.RemoveAt(bestIndex);
+            MoveToTarget(currentTarget);
+        }
+
+        void MoveToTarget(GameObject target)
+        {
+            currentTarget = target;
             lastTargetPosition = currentTarget.transform.position;
 
             bool isPickupable = IsInLayerMask(currentTarget.layer, pickupablesMask.value);
@@ -254,19 +314,45 @@ namespace EcoBot
             }
 
             if (currentState == CleanerState.Yielding) { UpdateYielding(); return; }
+            if (currentState == CleanerState.DetouringAroundAvoidable) { UpdateAvoidableDetour(); return; }
             if (currentState == CleanerState.AwaitingGuidance) return; // driven by PickupSequenceRoutine
 
             if (IsTravelState(currentState) && agent.isOnNavMesh && !agent.pathPending
                 && agent.remainingDistance > WorldApproachDistance)
             {
                 Collider blocker = DetectObstacleAhead();
-                if (blocker) { BeginYield(blocker); return; }
+                if (blocker)
+                {
+                    if (IsAvoidableCollider(blocker))
+                    {
+                        if (Time.time >= nextAvoidableDetourTime)
+                        {
+                            BeginAvoidableDetour(blocker);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        BeginYield(blocker);
+                        return;
+                    }
+                }
             }
 
-            if (IsTravelState(currentState) || currentState == CleanerState.Completed) TickLiveRescan();
+            if (IsTravelState(currentState) || currentState == CleanerState.Completed || currentState == CleanerState.Wandering)
+                TickLiveRescan();
+
+            if (wanderMode && (IsTravelState(currentState) || currentState == CleanerState.Wandering))
+                EnqueueNearbyTargets();
+
+            VacuumNearby();
 
             switch (currentState)
             {
+                case CleanerState.Wandering:
+                    UpdateWandering();
+                    break;
+
                 case CleanerState.MovingToPickupable:
                     if (!currentTarget || !currentTarget.activeInHierarchy) { SelectAndMoveToNextTarget(); return; }
                     if (HasArrived()) { agent.isStopped = true; StartCoroutine(PickupSequenceRoutine()); }
@@ -287,6 +373,214 @@ namespace EcoBot
                         StartCoroutine(VacuumSequenceRoutine());
                     }
                     break;
+            }
+        }
+
+        void VacuumNearby()
+        {
+            if (vacuumablesMask.value == 0) return;
+
+            float robotRadius = agent != null ? agent.radius : 0.35f;
+            float collectRadius = robotRadius + 0.05f;
+            float collectSqr = collectRadius * collectRadius;
+            Vector2 robotPos = new Vector2(transform.position.x, transform.position.z);
+
+            for (int i = remainingTargets.Count - 1; i >= 0; i--)
+            {
+                GameObject item = remainingTargets[i];
+                if (item == null || !item.activeInHierarchy) { remainingTargets.RemoveAt(i); continue; }
+                if (!IsInLayerMask(item.layer, vacuumablesMask.value)) continue;
+
+                Vector2 itemPos = new Vector2(item.transform.position.x, item.transform.position.z);
+                if ((itemPos - robotPos).sqrMagnitude <= collectSqr)
+                {
+                    remainingTargets.RemoveAt(i);
+                    if (currentTarget == item) currentTarget = null;
+                    Destroy(item);
+                }
+            }
+
+            if (currentTarget != null && IsInLayerMask(currentTarget.layer, vacuumablesMask.value))
+            {
+                Vector2 targetPos = new Vector2(currentTarget.transform.position.x, currentTarget.transform.position.z);
+                if ((targetPos - robotPos).sqrMagnitude <= collectSqr)
+                {
+                    Destroy(currentTarget);
+                    currentTarget = null;
+                }
+            }
+        }
+
+        void EnqueueNearbyTargets()
+        {
+            float pickupSqr = pickupDetectionRadius * pickupDetectionRadius;
+            float vacuumSqr = vacuumDetectionRadius * vacuumDetectionRadius;
+
+            for (int i = 0; i < remainingTargets.Count; i++)
+            {
+                GameObject item = remainingTargets[i];
+                if (item == null || !item.activeInHierarchy || item == currentTarget) continue;
+                if (deliveredObjects.Contains(item) || skippedObjects.Contains(item)) continue;
+                if (seenTargetsQueue.Contains(item)) continue;
+
+                float distSqr = (item.transform.position - transform.position).sqrMagnitude;
+                bool inRange = (IsInLayerMask(item.layer, vacuumablesMask.value) && distSqr <= vacuumSqr)
+                            || (IsInLayerMask(item.layer, pickupablesMask.value) && distSqr <= pickupSqr);
+
+                if (inRange)
+                    seenTargetsQueue.Enqueue(item);
+            }
+        }
+
+        void StartWandering()
+        {
+            currentTarget = null;
+            currentState = CleanerState.Wandering;
+            PickNewWanderDestination(reverse: false);
+        }
+
+        void UpdateWandering()
+        {
+            // 1. Check for nearby vacuumables or pickupables within detection radius
+            remainingTargets.RemoveAll(item => item == null || !item.activeInHierarchy ||
+                                               deliveredObjects.Contains(item) || skippedObjects.Contains(item));
+
+            GameObject closestPickup = null;
+            float closestPickupSqr = pickupDetectionRadius * pickupDetectionRadius;
+            GameObject closestVacuum = null;
+            float closestVacuumSqr = vacuumDetectionRadius * vacuumDetectionRadius;
+
+            for (int i = 0; i < remainingTargets.Count; i++)
+            {
+                GameObject item = remainingTargets[i];
+                float distSqr = (item.transform.position - transform.position).sqrMagnitude;
+
+                if (IsInLayerMask(item.layer, vacuumablesMask.value) && distSqr <= closestVacuumSqr)
+                {
+                    closestVacuumSqr = distSqr;
+                    closestVacuum = item;
+                }
+
+                if (IsInLayerMask(item.layer, pickupablesMask.value) && distSqr <= closestPickupSqr)
+                {
+                    closestPickupSqr = distSqr;
+                    closestPickup = item;
+                }
+            }
+
+            if (closestVacuum != null)
+            {
+                currentTarget = closestVacuum;
+                remainingTargets.Remove(closestVacuum);
+                if (closestVacuumSqr <= WorldVacuumRadius * WorldVacuumRadius)
+                {
+                    agent.isStopped = true;
+                    StartCoroutine(VacuumSequenceRoutine());
+                }
+                else
+                {
+                    Vector3 targetPoint = SampleNavMesh(currentTarget.transform.position, 2.0f);
+                    agent.stoppingDistance = 0.02f;
+                    agent.isStopped = false;
+                    agent.SetDestination(targetPoint);
+                    currentState = CleanerState.MovingToVacuumable;
+                    Debug.Log($"[RobotCleanerAI] Detected Vacuumable within {vacuumDetectionRadius}m: {currentTarget.name}");
+                }
+                return;
+            }
+
+            if (closestPickup != null)
+            {
+                currentTarget = closestPickup;
+                remainingTargets.Remove(closestPickup);
+                lastTargetPosition = currentTarget.transform.position;
+                Vector3 approachPoint = GetTargetApproachPosition(currentTarget.transform, WorldApproachDistance);
+                agent.stoppingDistance = 0.02f;
+                agent.isStopped = false;
+                agent.SetDestination(approachPoint);
+                currentState = CleanerState.MovingToPickupable;
+                Debug.Log($"[RobotCleanerAI] Detected Pickupable within {pickupDetectionRadius}m: {currentTarget.name}");
+                return;
+            }
+
+            // 2. Reverse direction & alert user if an avoidable item is within avoidableReverseRadius (2.5m)
+            if (Time.time >= nextReverseTime)
+            {
+                Collider nearbyAvoidable = FindNearbyAvoidable();
+                if (nearbyAvoidable != null)
+                {
+                    NotifyAvoidableEncountered(nearbyAvoidable);
+                    nextReverseTime = Time.time + 1.5f;
+                    PickNewWanderDestination(reverse: true, avoidPoint: nearbyAvoidable.bounds.center);
+                    return;
+                }
+            }
+
+            // 3. Pick a new wander point when arriving at the current one
+            if (HasArrived())
+                PickNewWanderDestination(reverse: false);
+        }
+
+        Collider FindNearbyAvoidable()
+        {
+            int mask = avoidableMask.value != 0 ? avoidableMask.value : obstacleMask.value;
+            if (mask == 0) return null;
+
+            int count = Physics.OverlapSphereNonAlloc(transform.position, avoidableReverseRadius, obstacleBuffer, mask, QueryTriggerInteraction.Ignore);
+            for (int i = 0; i < count; i++)
+            {
+                Collider col = obstacleBuffer[i];
+                if (col == null || col.transform.IsChildOf(transform)) continue;
+                if (IsInLayerMask(col.gameObject.layer, pickupablesMask.value) || IsInLayerMask(col.gameObject.layer, vacuumablesMask.value)) continue;
+                return col;
+            }
+            return null;
+        }
+
+        void PickNewWanderDestination(bool reverse, Vector3? avoidPoint = null)
+        {
+            if (!agent || !agent.isOnNavMesh) return;
+
+            Vector3 awayDir = -transform.forward;
+            if (avoidPoint.HasValue)
+            {
+                Vector3 delta = transform.position - avoidPoint.Value;
+                delta.y = 0f;
+                if (delta.sqrMagnitude > 0.01f) awayDir = delta.normalized;
+            }
+            awayDir.y = 0f;
+            if (awayDir.sqrMagnitude < 0.01f) awayDir = -transform.forward;
+            awayDir.Normalize();
+
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                Vector3 desiredDir;
+                if (reverse && attempt < 4)
+                {
+                    float angleOffset = attempt == 0 ? 0f : (attempt % 2 == 1 ? 45f : -45f) * ((attempt + 1) / 2);
+                    desiredDir = Quaternion.Euler(0f, angleOffset, 0f) * awayDir;
+                }
+                else
+                {
+                    desiredDir = new Vector3(Random.Range(-1f, 1f), 0f, Random.Range(-1f, 1f)).normalized;
+                }
+
+                if (desiredDir.sqrMagnitude < 0.01f) desiredDir = awayDir;
+
+                float dist = reverse ? Random.Range(2.5f, Mathf.Max(3.5f, wanderRadius * 0.6f)) : Random.Range(wanderRadius * 0.4f, wanderRadius);
+                Vector3 candidate = transform.position + desiredDir * dist;
+                if (NavMesh.SamplePosition(candidate, out NavMeshHit hit, 2.5f, NavMesh.AllAreas))
+                {
+                    if (avoidPoint.HasValue && Vector3.Distance(hit.position, avoidPoint.Value) < avoidableReverseRadius)
+                        continue;
+                    if (Vector3.Distance(hit.position, transform.position) < 1.0f)
+                        continue;
+
+                    agent.stoppingDistance = 0.25f;
+                    agent.isStopped = false;
+                    agent.SetDestination(hit.position);
+                    return;
+                }
             }
         }
 
@@ -330,6 +624,92 @@ namespace EcoBot
                 if (sqr < bestSqr) { bestSqr = sqr; closest = col; }
             }
             return closest;
+        }
+
+        bool IsAvoidableCollider(Collider col)
+        {
+            if (col == null) return false;
+            if (avoidableMask.value != 0 && IsInLayerMask(col.gameObject.layer, avoidableMask.value)) return true;
+            return avoidablesLayer != -1 && col.gameObject.layer == avoidablesLayer;
+        }
+
+        void NotifyAvoidableEncountered(Collider avoidableCol)
+        {
+            if (avoidableCol == null || Time.time < nextAvoidableAlertTime) return;
+            nextAvoidableAlertTime = Time.time + 5.0f;
+            onAvoidableEncountered?.Invoke(avoidableCol.gameObject);
+            Say($"Avoidable detected: '{avoidableCol.name}'. Turning around to continue.");
+        }
+
+        void BeginAvoidableDetour(Collider avoidable)
+        {
+            NotifyAvoidableEncountered(avoidable);
+            stateBeforeDetour = currentState;
+            currentState = CleanerState.DetouringAroundAvoidable;
+            nextAvoidableDetourTime = Time.time + 2.5f;
+            detourEndTime = Time.time + 1.8f;
+
+            Vector3 away = transform.position - avoidable.bounds.center;
+            away.y = 0f;
+            if (away.sqrMagnitude < 0.01f) away = -transform.forward;
+            away.Normalize();
+
+            Vector3 side = Vector3.Cross(Vector3.up, away);
+            Vector3[] candidates = new Vector3[]
+            {
+                (away * 0.75f + side * 0.65f).normalized * 2.2f,
+                (away * 0.75f - side * 0.65f).normalized * 2.2f,
+                away * 2.2f,
+                -transform.forward * 2.0f
+            };
+
+            NavMeshPath testPath = new NavMeshPath();
+            Vector3 detourTarget = transform.position - transform.forward * 1.5f;
+            foreach (Vector3 offset in candidates)
+            {
+                if (NavMesh.SamplePosition(transform.position + offset, out NavMeshHit hit, 1.5f, NavMesh.AllAreas))
+                {
+                    if (agent.CalculatePath(hit.position, testPath) && testPath.status == NavMeshPathStatus.PathComplete)
+                    {
+                        detourTarget = hit.position;
+                        break;
+                    }
+                }
+            }
+
+            agent.stoppingDistance = 0.1f;
+            agent.isStopped = false;
+            agent.SetDestination(detourTarget);
+        }
+
+        void UpdateAvoidableDetour()
+        {
+            if (Time.time >= detourEndTime || (!agent.pathPending && agent.remainingDistance <= 0.25f))
+            {
+                EndAvoidableDetour();
+            }
+        }
+
+        void EndAvoidableDetour()
+        {
+            currentState = stateBeforeDetour;
+            bool needsTarget = currentState == CleanerState.MovingToPickupable || currentState == CleanerState.MovingToVacuumable;
+            if (needsTarget && (!currentTarget || !currentTarget.activeInHierarchy))
+            {
+                SelectAndMoveToNextTarget();
+                return;
+            }
+
+            if (IsTravelState(currentState))
+            {
+                agent.stoppingDistance = 0.02f;
+                agent.isStopped = false;
+                agent.SetDestination(ComputeDestination(currentState));
+            }
+            else
+            {
+                StartWandering();
+            }
         }
 
         void BeginYield(Collider blocker)
@@ -380,7 +760,7 @@ namespace EcoBot
             {
                 case CleanerState.MovingToPickupable: return GetTargetApproachPosition(currentTarget.transform, WorldApproachDistance);
                 case CleanerState.MovingToVacuumable: return SampleNavMesh(currentTarget.transform.position, 2.0f);
-                case CleanerState.MovingToDropOff: return GetDropOffApproachPosition(dropOffLocation);
+                case CleanerState.MovingToDropOff: return GetDropOffApproachPosition(GetDropOffFor(arm ? arm.HeldObject : null));
                 default: return agent.destination;
             }
         }
@@ -454,7 +834,8 @@ namespace EcoBot
             if (arm != null && (arm.HeldObject == obj || (arm.IsBusy && currentTarget == obj))) return;
 
             skippedObjects.Remove(obj);
-            if (!remainingTargets.Contains(obj) && !deliveredObjects.Contains(obj)
+            deliveredObjects.Remove(obj);
+            if (!remainingTargets.Contains(obj)
                 && obj != currentTarget && obj.activeInHierarchy)
                 remainingTargets.Add(obj);
 
@@ -522,14 +903,15 @@ namespace EcoBot
                 else { skippedObjects.Add(attempted); Say($"Could not pick up '{attempted.name}'. Skipping it."); }
             }
 
-            if (arm && arm.HeldObject != null && dropOffLocation != null)
+            Transform targetDropOff = GetDropOffFor(arm ? arm.HeldObject : null);
+            if (arm && arm.HeldObject != null && targetDropOff != null)
             {
-                Vector3 dropApproach = GetDropOffApproachPosition(dropOffLocation);
+                Vector3 dropApproach = GetDropOffApproachPosition(targetDropOff);
                 agent.stoppingDistance = 0.05f;
                 agent.isStopped = false;
                 agent.SetDestination(dropApproach);
                 currentState = CleanerState.MovingToDropOff;
-                Debug.Log($"[RobotCleanerAI] Carrying {arm.HeldObject.name} to drop-off ({dropOffLocation.name}).");
+                Debug.Log($"[RobotCleanerAI] Carrying {arm.HeldObject.name} to drop-off ({targetDropOff.name}).");
             }
             else SelectAndMoveToNextTarget();
         }
@@ -550,18 +932,28 @@ namespace EcoBot
             guidanceResolved.Remove(target);
         }
 
+        Transform GetDropOffFor(GameObject obj)
+        {
+            if (obj != null && trashCanLocation != null && obj.CompareTag("Litter"))
+                return trashCanLocation;
+            return dropOffLocation;
+        }
+
         IEnumerator DropOffSequenceRoutine()
         {
             currentState = CleanerState.DroppingOff;
-            if (dropOffLocation) yield return RotateTowardsPointRoutine(dropOffLocation.position);
+            Transform targetDropOff = GetDropOffFor(arm ? arm.HeldObject : null);
+            if (targetDropOff) yield return RotateTowardsPointRoutine(targetDropOff.position);
 
             if (arm && arm.HeldObject != null)
             {
                 GameObject droppedObj = arm.HeldObject;
                 deliveredObjects.Add(droppedObj);
 
-                Vector3 placeSpot = transform.position + transform.forward * WorldApproachDistance;
-                placeSpot.y = transform.position.y;
+                Vector3 placeSpot = targetDropOff != null
+                    ? targetDropOff.position
+                    : transform.position + transform.forward * WorldApproachDistance;
+                if (targetDropOff == null) placeSpot.y = transform.position.y;
                 arm.PlaceAt(placeSpot);
                 yield return new WaitUntil(() => !arm.IsBusy);
             }

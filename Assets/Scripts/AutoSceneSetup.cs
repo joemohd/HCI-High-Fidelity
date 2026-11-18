@@ -39,7 +39,7 @@ public class AutoSceneSetup : MonoBehaviour
         }
 
         // Directional Light - Soft even lighting
-        Light light = FindFirstObjectByType<Light>();
+        Light light = FindAnyObjectByType<Light>();
         if (light == null)
         {
             GameObject lObj = new GameObject("Directional Light");
@@ -239,7 +239,7 @@ public class AutoSceneSetup : MonoBehaviour
         exitDoor.transform.position = new Vector3(0, 0, -10.0f);
 
         // 8. Scenario Manager
-        RestaurantScenarioManager mgr = FindFirstObjectByType<RestaurantScenarioManager>();
+        RestaurantScenarioManager mgr = FindAnyObjectByType<RestaurantScenarioManager>();
         if (mgr == null)
         {
             GameObject mgrObj = new GameObject("RestaurantScenarioManager");

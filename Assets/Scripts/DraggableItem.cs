@@ -26,7 +26,7 @@ public class DraggableItem : MonoBehaviour
 
     void Start()
     {
-        robots = FindObjectsByType<RobotCleanerAI>(FindObjectsSortMode.None);
+        robots = FindObjectsByType<RobotCleanerAI>();
         if (robots.Length > 0) arm = robots[0].GetComponent<RobotArmController>();
     }
 
@@ -81,7 +81,7 @@ public class DraggableItem : MonoBehaviour
         if (rb != null) rb.isKinematic = rbWasKinematic;
 
         if (robots == null || robots.Length == 0)
-            robots = FindObjectsByType<RobotCleanerAI>(FindObjectsSortMode.None);
+            robots = FindObjectsByType<RobotCleanerAI>();
 
         foreach (var ai in robots)
             if (ai != null) ai.NotifyObjectMoved(gameObject);
@@ -140,7 +140,7 @@ public class DraggableItem : MonoBehaviour
         int layer = LayerMask.NameToLayer("Pickupables");
         if (layer < 0) return;
 
-        foreach (var col in FindObjectsByType<Collider>(FindObjectsSortMode.None))
+        foreach (var col in FindObjectsByType<Collider>())
         {
             if (col == null || col.gameObject.layer != layer) continue;
 

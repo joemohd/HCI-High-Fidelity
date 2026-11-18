@@ -53,7 +53,7 @@ public class GuidancePromptUI : MonoBehaviour
     private void HookIntoScene()
     {
         Unhook();
-        currentArm = FindFirstObjectByType<RobotArmController>();
+        currentArm = FindAnyObjectByType<RobotArmController>();
         if (currentArm != null) currentArm.onGuidanceNeeded.AddListener(OnGuidanceNeeded);
     }
 
@@ -142,7 +142,7 @@ public class GuidancePromptUI : MonoBehaviour
         Hide();
         if (target == null) return;
 
-        RobotCleanerAI ai = FindFirstObjectByType<RobotCleanerAI>();
+        RobotCleanerAI ai = FindAnyObjectByType<RobotCleanerAI>();
         if (ai != null) ai.ProvideGuidance(target, approve);
         else Debug.LogWarning("[GuidancePromptUI] No RobotCleanerAI in scene to receive ProvideGuidance.");
     }
@@ -194,7 +194,7 @@ public class GuidancePromptUI : MonoBehaviour
 
     private static void EnsureEventSystem()
     {
-        if (FindFirstObjectByType<EventSystem>() != null) return;
+        if (FindAnyObjectByType<EventSystem>() != null) return;
         GameObject es = new GameObject("EventSystem");
         es.AddComponent<EventSystem>();
 #if ENABLE_INPUT_SYSTEM
